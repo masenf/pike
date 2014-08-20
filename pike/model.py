@@ -369,19 +369,18 @@ class Client(object):
     def dispose_lease(self, lease):
         del self._leases[lease.lease_key.tostring()]
 
-class Connection(asyncore.dispatcher):
-    """
-    Connection to server.
 
-    Represents a connection to a server and handles all socket operations
-    and request/response dispatch.
+class NBConnection(asyncore.dispatcher):
+    """
+    Connection over Netbios only. Provides support for synchronous Netbios
+    frames.
 
     @type client: Client
     @ivar client: The Client object associated with this connection.
     @ivar server: The server name or address
     @ivar port: The server port
     """
-    def __init__(self, client, server, port=445):
+    def __init__(self, server, port=139):
         """
         Constructor.
 
@@ -392,16 +391,9 @@ class Connection(asyncore.dispatcher):
         self._in_buffer = array.array('B')
         self._watermark = 4
         self._out_buffer = None
-        self._next_mid = 0
-        self._mid_blacklist = set()
         self._out_queue = []
         self._future_map = {}
-        self._sessions = {}
-        self._binding = None
-        self._binding_key = None
-        self._settings = {}
         
-        self.client = client
         self.server = server
         self.port = port
         self.remote_addr = None
@@ -412,19 +404,6 @@ class Connection(asyncore.dispatcher):
     
         self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
         self.connect((server,port))
-        self.client._connections.append(self)
-
-    def next_mid(self):
-        while self._next_mid in self._mid_blacklist:
-            self._next_mid += 1
-        result = self._next_mid
-        self._next_mid += 1
-
-        return result
-
-    def reserve_mid(mid):
-        self._mid_blacklist.add(mid)
-
     #
     # async dispatcher callbacks
     #
@@ -434,17 +413,11 @@ class Connection(asyncore.dispatcher):
 
     def writable(self):
         # Do we have data to send?
-        # FIXME: credit tracking
         return self._out_buffer != None or len(self._out_queue) != 0
 
     def handle_connect(self):
         self.local_addr = self.socket.getsockname()
         self.remote_addr = self.socket.getpeername()
-
-        self.client.logger.debug('connect: %s/%s -> %s/%s',
-                                 self.local_addr[0], self.local_addr[1],
-                                 self.remote_addr[0], self.remote_addr[1])
-        pass
 
     def handle_read(self):
         # Try to read the next netbios frame
@@ -453,7 +426,11 @@ class Connection(asyncore.dispatcher):
         self._in_buffer.extend(array.array('B', data))
         avail = len(self._in_buffer)
         if avail >= 4:
-            self._watermark = 4 + struct.unpack('>L', self._in_buffer[0:4])[0]
+            # netbios opcode sub byte handling
+            opcode_len = struct.unpack('>L', self._in_buffer[0:4])[0]
+            opcode = opcode_len >> 24
+            msg_len = opcode_len & 0x00FFFFFF
+            self._watermark = 4 + msg_len
         if avail == self._watermark:
             nb = self.frame()
             nb.parse(self._in_buffer)
@@ -463,7 +440,6 @@ class Connection(asyncore.dispatcher):
 
     def handle_write(self):
         # Try to write out more data
-        # FIXME: credit tracking
         while self._out_buffer is None and len(self._out_queue):
             self._out_buffer = self._prepare_outgoing()
         sent = self.send(self._out_buffer)
@@ -485,22 +461,11 @@ class Connection(asyncore.dispatcher):
         This unceremoniously terminates the connection and fails all
         outstanding requests with EOFError.
         """
-        if self not in self.client._connections:
-            return
-
         asyncore.dispatcher.close(self)
 
         # Run down connection
         if self.error is None:
             self.error = EOFError("close")
-
-        if self.remote_addr is not None:
-            self.client.logger.debug("disconnect (%s/%s -> %s/%s): %s",
-                                     self.local_addr[0], self.local_addr[1],
-                                     self.remote_addr[0], self.remote_addr[1],
-                                     self.error)
-
-        self.client._connections.remove(self)
 
         for future in self._out_queue:
             future.complete(self.error, self.traceback)
@@ -510,11 +475,135 @@ class Connection(asyncore.dispatcher):
             future.complete(self.error, self.traceback)
         self._future_map.clear()
 
-        for session in self._sessions.values():
-            session.delchannel(self)
-
         self.traceback = None
 
+    def _prepare_outgoing(self):
+        # Try to prepare an outgoing packet
+
+        if 0 in self._future_map:
+            return None     # waiting for nb response
+
+        future = self._out_queue[0]
+        del self._out_queue[0]
+
+        with future:
+            req = future.request
+            buf = req.serialize()
+            if hasattr(req, "opcode") and req.opcode == 0x85:
+                # keep-alive packets are discarded by the server
+                future.complete(req)
+            else:
+                self._future_map['nbss'] = future
+            
+        return buf
+
+    def _dispatch_incoming(self, res):
+        future = self._future_map['nbss']
+        del self._future_map['nbss']
+        future.complete(res)
+
+    def submit(self, req):
+        """
+        Submit request.
+
+        Submits a L{netbios.Netbios} frame for sending.  Returns
+        a list of L{Future} objects, one for each corresponding
+        L{smb2.Smb2} frame in the request.
+        """
+        if self.error is not None:
+            raise self.error
+        futures = []
+        future = Future(req)
+        futures.append(future)
+        self._out_queue.append(future)
+        return futures
+
+    def transceive(self, req):
+        """
+        Submit request and wait for responses.
+
+        Submits a L{netbios.Netbios} frame for sending.  Waits for
+        and returns a list of L{smb2.Smb2} response objects, one for each
+        corresponding L{smb2.Smb2} frame in the request.
+        """
+        return map(Future.result, self.submit(req))
+
+    # Return a fresh netbios frame with connection as context
+    def frame(self):
+        return netbios.Netbios(context=self)
+
+class Connection(NBConnection):
+    """
+    Connection to server.
+
+    Represents a connection to a server and handles all socket operations
+    and request/response dispatch.
+
+    @type client: Client
+    @ivar client: The Client object associated with this connection.
+    @ivar server: The server name or address
+    @ivar port: The server port
+    """
+    def __init__(self, client, server, port=445):
+        """
+        Constructor.
+
+        This should generally not be used directly.  Instead,
+        use L{Client.connect}().
+        """
+        self.client = client
+        self._next_mid = 0
+        # reserve mid 0 for netbios only packets
+        self._mid_blacklist = set()
+        self._sessions = {}
+        self._binding = None
+        self._binding_key = None
+        self._settings = {}
+        
+        NBConnection.__init__(self, server, port)
+        self.client._connections.append(self)
+
+    def next_mid(self):
+        while self._next_mid in self._mid_blacklist:
+            self._next_mid += 1
+        result = self._next_mid
+        self._next_mid += 1
+
+        return result
+
+    def reserve_mid(mid):
+        self._mid_blacklist.add(mid)
+
+    def writable(self):
+        # FIXME: credit tracking
+        return NBConnection.writable(self)
+
+    def handle_connect(self):
+        NBConnection.handle_connect(self)
+        self.client.logger.debug('connect: %s/%s -> %s/%s',
+                                 self.local_addr[0], self.local_addr[1],
+                                 self.remote_addr[0], self.remote_addr[1])
+    def handle_write(self):
+        # FIXME: credit tracking
+        NBConnection.handle_write(self)
+
+    def close(self):
+        if self not in self.client._connections:
+            return
+
+        NBConnection.close(self)
+
+        self.client._connections.remove(self)
+
+        if self.remote_addr is not None:
+            self.client.logger.debug("disconnect (%s/%s -> %s/%s): %s",
+                                     self.local_addr[0], self.local_addr[1],
+                                     self.remote_addr[0], self.remote_addr[1],
+                                     self.error)
+
+        for session in self._sessions.values():
+            session.delchannel(self)
+    
     def _prepare_outgoing(self):
         # Try to prepare an outgoing packet
 
@@ -645,16 +734,6 @@ class Connection(asyncore.dispatcher):
                 futures.append(future)
         return futures
 
-    def transceive(self, req):
-        """
-        Submit request and wait for responses.
-
-        Submits a L{netbios.Netbios} frame for sending.  Waits for
-        and returns a list of L{smb2.Smb2} response objects, one for each
-        corresponding L{smb2.Smb2} frame in the request.
-        """
-        return map(Future.result, self.submit(req))
-
     def negotiate(self):
         """
         Perform dialect negotiation.
@@ -752,10 +831,6 @@ class Connection(asyncore.dispatcher):
             session = Session(self.client, smb_res.session_id, session_key)
 
         return session.addchannel(self, signing_key)
-
-    # Return a fresh netbios frame with connection as context
-    def frame(self):
-        return netbios.Netbios(context=self)
 
     # Return a fresh smb2 frame with connection as context
     # Put it in a netbios frame automatically if none given

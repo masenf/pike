@@ -48,6 +48,7 @@ maintaining a clear visual distinction between values and types.
 
 import array
 import core
+import netbios
 import nttime
 import re
 import ntstatus
@@ -109,7 +110,9 @@ ShareCaps.import_items(globals())
 RELATED_FID = (2**64-1,2**64-1)
 UNSOLICITED_MESSAGE_ID = (2**64-1)
 
-class Smb2(core.Frame):
+class Smb2(netbios.NetbiosProtocol):
+    proto_magic = '\xfeSMB'
+
     _request_table = {}
     _response_table = {}
     _notification_table = {}
